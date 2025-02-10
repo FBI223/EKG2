@@ -1,15 +1,15 @@
 import os
-import wfdb
-import numpy as np
-import pandas as pd
+
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+import numpy as np
+import seaborn as sns
 import tensorflow as tf
+import wfdb
+from scipy.signal import resample
+from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import train_test_split
 from tensorflow.keras import layers, models
 from tensorflow.keras.utils import to_categorical
-import seaborn as sns
-from sklearn.metrics import confusion_matrix
-from scipy.signal import resample
 
 
 def resample_ecg_signal(signal, annotation_samples, original_fs, target_fs):
@@ -37,7 +37,7 @@ def resample_ecg_signal(signal, annotation_samples, original_fs, target_fs):
 
 def get_record_ids(mitdb_path):
     record_ids = [f.split('.')[0] for f in os.listdir(mitdb_path) if f.endswith('.hea')]
-    return (sorted(list(set(record_ids))))
+    return sorted(list(set(record_ids)))
 
 
 
@@ -180,7 +180,7 @@ def main():
 
     model = build_cnn((optimal_segment_length, 1), num_classes)
     history = model.fit(X_train, y_train, validation_data=(X_val, y_val),
-                        epochs=40, batch_size=32, callbacks=[
+                        epochs=20, batch_size=32, callbacks=[
             tf.keras.callbacks.EarlyStopping(patience=4, restore_best_weights=True)
         ])
 
