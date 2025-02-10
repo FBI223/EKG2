@@ -9,6 +9,30 @@ from tensorflow.keras import layers, models
 from tensorflow.keras.utils import to_categorical
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
+from scipy.signal import resample
+
+
+def resample_ecg_signal(signal, annotation_samples, original_fs, target_fs):
+    """
+    Resampluje sygnał EKG do nowej częstotliwości próbkowania i dostosowuje adnotacje.
+
+    :param signal: Oryginalny sygnał EKG
+    :param annotation_samples: Indeksy adnotacji (np. załamków R)
+    :param original_fs: Oryginalna częstotliwość próbkowania
+    :param target_fs: Docelowa częstotliwość próbkowania
+    :return: Nowy sygnał EKG i nowe indeksy adnotacji
+    """
+    # Obliczamy nową długość sygnału po resamplingu
+    new_length = int(len(signal) * (target_fs / original_fs))
+
+    # Resampling sygnału
+    resampled_signal = resample(signal, new_length)
+
+    # Przeskalowanie adnotacji (R-peaks)
+    scale_factor = target_fs / original_fs
+    resampled_annotations = np.round(np.array(annotation_samples) * scale_factor).astype(int)
+
+    return resampled_signal, resampled_annotations
 
 
 def get_record_ids(mitdb_path):
@@ -17,7 +41,7 @@ def get_record_ids(mitdb_path):
 
 
 
-def load_ecg_data(mitdb_path, record_ids):
+def load_ecg_data(mitdb_path, record_ids, target_fs=360):
     signals = []
     labels = []
     rr_intervals = []
@@ -26,6 +50,12 @@ def load_ecg_data(mitdb_path, record_ids):
         record = wfdb.rdrecord(f'{mitdb_path}/{record_id}')
         annotation = wfdb.rdann(f'{mitdb_path}/{record_id}', 'atr')
         signal = record.p_signal[:, 0]
+
+
+        original_fs = record.fs  # Oryginalna częstotliwość próbkowania
+        if original_fs != target_fs:
+            signal, annotation.sample = resample_ecg_signal(signal, annotation.sample, original_fs, target_fs)
+
 
         rr_intervals.extend(np.diff(annotation.sample))
 
@@ -39,8 +69,13 @@ def load_ecg_data(mitdb_path, record_ids):
 
 
 
-
 def determine_optimal_segment_length(rr_intervals):
+    """
+    Dynamicznie określa optymalną długość segmentu na podstawie mediany odstępów RR.
+
+    :param rr_intervals: Lista odstępów RR
+    :return: Optymalna długość segmentu (liczba próbek)
+    """
     return int(np.median(rr_intervals))
 
 
@@ -106,8 +141,9 @@ def count_all_labels_from_mitdb():
 
 def main():
     mitdb_path = "mitdb/"
-    label_map_v0 = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
-    label_map = {
+    label_map = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
+    ''' 
+         label_map = {
         'N': 0,  # Normal beat (najczęstsza klasa)
         'V': 1,  # Premature Ventricular Contraction (PVC) - istotne klinicznie
         'A': 2,  # Atrial Premature Beat (APB) - mniej liczne, ale ważne
@@ -116,6 +152,7 @@ def main():
         'F': 5,  # Fusion of ventricular and normal beat (803 wystąpienia)
         'f': 6   # Fusion of paced and normal beat (982 wystąpienia)
     }
+     '''
 
 
     num_classes = len(label_map)
@@ -123,7 +160,7 @@ def main():
     record_ids = get_record_ids(mitdb_path)
     print(f"Znalezione rekordy: {record_ids}")
 
-    signals, labels, rr_intervals = load_ecg_data(mitdb_path, record_ids)
+    signals, labels, rr_intervals = load_ecg_data(mitdb_path, record_ids,)
     optimal_segment_length = determine_optimal_segment_length(rr_intervals)
     print(f"Optymalna długość segmentu: {optimal_segment_length}")
 
