@@ -64,7 +64,7 @@ def preprocess_signals(signals, labels, optimal_segment_length, label_map):
 
 
 
-def build_cnn(input_shape):
+def build_cnn(input_shape, num_classes):
     model = models.Sequential([
         layers.Conv1D(32, kernel_size=5, activation='relu', input_shape=input_shape),
         layers.MaxPooling1D(pool_size=2),
@@ -73,16 +73,51 @@ def build_cnn(input_shape):
         layers.Conv1D(128, kernel_size=3, activation='relu'),
         layers.GlobalAveragePooling1D(),
         layers.Dense(64, activation='relu'),
-        layers.Dense(5, activation='softmax')
+        layers.Dense(num_classes, activation='softmax')  # Poprawiona liczba klas
     ])
     model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
 
 
+def count_all_labels_from_mitdb():
+    """
+    Wczytuje wszystkie etykiety z bazy MIT-BIH i zwraca słownik z ich licznością.
+
+    :return: Słownik {etykieta: liczba wystąpień}
+    """
+    mitdb_path = "mitdb/"
+    label_counts = {}
+
+    # Pobranie listy wszystkich rekordów
+    record_ids = [f.split('.')[0] for f in os.listdir(mitdb_path) if f.endswith('.hea')]
+    record_ids = list(set(record_ids))  # Usunięcie duplikatów
+
+    # Iteracja przez każdy rekord w MIT-BIH
+    for record_id in record_ids:
+        annotation = wfdb.rdann(f'{mitdb_path}/{record_id}', 'atr')
+
+        # Zliczanie etykiet
+        for label in annotation.symbol:
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+    return label_counts
+
+
 def main():
     mitdb_path = "mitdb/"
-    label_map = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
+    label_map_v0 = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
+    label_map = {
+        'N': 0,  # Normal beat (najczęstsza klasa)
+        'V': 1,  # Premature Ventricular Contraction (PVC) - istotne klinicznie
+        'A': 2,  # Atrial Premature Beat (APB) - mniej liczne, ale ważne
+        'L': 3,  # Left Bundle Branch Block Beat (LBBB)
+        'R': 4,  # Right Bundle Branch Block Beat (RBBB)
+        'F': 5,  # Fusion of ventricular and normal beat (803 wystąpienia)
+        'f': 6   # Fusion of paced and normal beat (982 wystąpienia)
+    }
+
+
     num_classes = len(label_map)
 
     record_ids = get_record_ids(mitdb_path)
@@ -106,9 +141,9 @@ def main():
     y_val = to_categorical(y_val, num_classes=num_classes)
     y_test = to_categorical(y_test, num_classes=num_classes)
 
-    model = build_cnn((optimal_segment_length, 1))
+    model = build_cnn((optimal_segment_length, 1), num_classes)
     history = model.fit(X_train, y_train, validation_data=(X_val, y_val),
-                        epochs=20, batch_size=32, callbacks=[
+                        epochs=40, batch_size=32, callbacks=[
             tf.keras.callbacks.EarlyStopping(patience=4, restore_best_weights=True)
         ])
 
