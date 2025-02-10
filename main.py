@@ -1,5 +1,4 @@
 import os
-
 import wfdb
 import numpy as np
 import pandas as pd
@@ -13,51 +12,54 @@ from tensorflow.keras.utils import to_categorical
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 
-
-
-
-
-
-
-# Ścieżka do folderu z MIT-BIH (upewnij się, że masz pobrane pliki)
+# Ścieżka do folderu z MIT-BIH
 mitdb_path = "mitdb/"
 
-# Pobranie listy wszystkich rekordów z folderu (ignoruje rozszerzenia .atr, .hea, itp.)
+# Pobranie listy wszystkich rekordów
 record_ids = [f.split('.')[0] for f in os.listdir(mitdb_path) if f.endswith('.hea')]
 record_ids = list(set(record_ids))  # Usunięcie duplikatów
-
-# Sortowanie numerów dla lepszej czytelności
 record_ids.sort()
+
 # Wypisanie znalezionych rekordów
 print(f"Znalezione rekordy: {record_ids}")
 
-# Pobranie sygnałów EKG z MIT-BIH
+# Pobranie sygnałów EKG
 signals = []
 labels = []
+rr_intervals = []
 
 for record_id in record_ids:
     record = wfdb.rdrecord(f'mitdb/{record_id}')
     annotation = wfdb.rdann(f'mitdb/{record_id}', 'atr')
+    signal = record.p_signal[:, 0]
+    fs = record.fs
 
-    signal = record.p_signal[:, 0]  # Wybór jednego kanału
-    fs = record.fs  # Częstotliwość próbkowania
+    rr_intervals.extend(np.diff(annotation.sample))  # Obliczanie odstępów RR
 
     for i, r in enumerate(annotation.sample):
         if i + 1 < len(annotation.sample):
             next_r = annotation.sample[i + 1]
-            segment = signal[r:next_r]  # Pobieramy segment między załamkami R
-            if len(segment) >= 187:
-                signals.append(segment[:187])
-                labels.append(annotation.symbol[i])
+            segment = signal[r:next_r]
+            signals.append(segment)
+            labels.append(annotation.symbol[i])
 
-# Mapowanie etykiet do klas
-label_map = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}  # Klasy dla różnych arytmii
-filtered_labels = []
+# Określenie optymalnej długości segmentu na podstawie mediany odstępów RR
+optimal_segment_length = int(np.median(rr_intervals))
+print(f"Optymalna długość segmentu: {optimal_segment_length}")
+
+# Przycięcie/pad segmentów do optymalnej długości
 filtered_signals = []
+filtered_labels = []
+label_map = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
 
 for i in range(len(labels)):
     if labels[i] in label_map:
-        filtered_signals.append(signals[i])
+        segment = signals[i]
+        if len(segment) >= optimal_segment_length:
+            filtered_signals.append(segment[:optimal_segment_length])
+        else:
+            pad_width = optimal_segment_length - len(segment)
+            filtered_signals.append(np.pad(segment, (0, pad_width), mode='constant'))
         filtered_labels.append(label_map[labels[i]])
 
 X = np.array(filtered_signals)
@@ -70,7 +72,7 @@ X = (X - np.mean(X, axis=0)) / np.std(X, axis=0)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, random_state=42)
 
-X_train = X_train[..., np.newaxis]  # Dodanie wymiaru kanału dla CNN
+X_train = X_train[..., np.newaxis]
 X_val = X_val[..., np.newaxis]
 X_test = X_test[..., np.newaxis]
 
@@ -88,13 +90,13 @@ def build_cnn(input_shape):
         layers.Conv1D(128, kernel_size=3, activation='relu'),
         layers.GlobalAveragePooling1D(),
         layers.Dense(64, activation='relu'),
-        layers.Dense(5, activation='softmax')  # 5 klas arytmii
+        layers.Dense(5, activation='softmax')
     ])
     model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
 # Trenowanie modelu
-model = build_cnn((187, 1))
+model = build_cnn((optimal_segment_length, 1))
 history = model.fit(X_train, y_train, validation_data=(X_val, y_val),
                     epochs=50, batch_size=32, callbacks=[
         tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
