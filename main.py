@@ -29,7 +29,8 @@ label_map = {
     'R': 5   # Blok prawej odnogi (RBBB)
 }
 
-num_classes = len(label_map)  # Usunięto dodatkową klasę "Unknown"
+num_classes = len(label_map) + 1  # Dodajemy nową klasę "Unknown"
+
 
 def get_class_weights(labels):
     class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
@@ -63,8 +64,8 @@ def load_ecg_data(db_path, record_ids, target_fs=360):
                 labels.append(label_map[annotation.symbol[i]])
     return signals, labels, rr_intervals
 
-def determine_optimal_segment_length(rr_intervals_mitdb, rr_intervals_svdb):
-    combined_rr_intervals = np.concatenate([rr_intervals_mitdb, rr_intervals_svdb])
+def determine_optimal_segment_length(all_intervals):
+    combined_rr_intervals = np.concatenate(all_intervals)
     return int(np.median(combined_rr_intervals))
 
 def preprocess_signals(signals, labels, optimal_segment_length):
@@ -80,28 +81,28 @@ def preprocess_signals(signals, labels, optimal_segment_length):
 
 def build_cnn(input_shape, number_of_classes):
     model = models.Sequential([
-        layers.Conv1D(64, kernel_size=7, strides=1, padding='same', input_shape=input_shape),
+        layers.Conv1D(64, kernel_size=11, strides=1, padding='same', input_shape=input_shape),
         layers.BatchNormalization(),
-        layers.LeakyReLU(negative_slope=0.1),
+        layers.LeakyReLU(alpha=0.1),
         layers.MaxPooling1D(pool_size=2),
 
-        layers.Conv1D(128, kernel_size=5, strides=1, padding='same'),
+        layers.Conv1D(128, kernel_size=7, strides=1, padding='same'),
         layers.BatchNormalization(),
-        layers.LeakyReLU(negative_slope=0.1),
+        layers.LeakyReLU(alpha=0.1),
+        layers.MaxPooling1D(pool_size=2),
+
+        layers.Conv1D(256, kernel_size=5, strides=1, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(alpha=0.1),
         layers.MaxPooling1D(pool_size=2),
 
         layers.Conv1D(256, kernel_size=3, strides=1, padding='same'),
         layers.BatchNormalization(),
-        layers.LeakyReLU(negative_slope=0.1),
-        layers.MaxPooling1D(pool_size=2),
+        layers.LeakyReLU(alpha=0.1),
 
-        layers.Conv1D(512, kernel_size=3, strides=1, padding='same'),
-        layers.BatchNormalization(),
-        layers.LeakyReLU(negative_slope=0.1),
-        layers.GlobalAveragePooling1D(),
-
+        layers.LSTM(64, return_sequences=False),  # Dodanie warstwy LSTM
         layers.Dense(128, activation='relu'),
-        layers.Dropout(0.5),  # Mocniejszy dropout
+        layers.Dropout(0.5),
         layers.Dense(number_of_classes, activation='softmax')
     ])
 
@@ -111,7 +112,6 @@ def build_cnn(input_shape, number_of_classes):
     return model
 
 
-
 def balance_dataset(X, y):
     smote = SMOTE(sampling_strategy='auto', random_state=42)
     X_resampled, y_resampled = smote.fit_resample(X, y)
@@ -119,13 +119,10 @@ def balance_dataset(X, y):
 
 
 
-
-
-
 def main():
+    # 🔹 Ustawienia TensorFlow dla optymalnej pracy na GPU
     os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-    TF_CPP_MIN_LOG_LEVEL = '2'
-
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
     # Wczytanie rekordów MITDB
     record_ids = get_record_ids(mitdb_path)
@@ -136,7 +133,7 @@ def main():
     signals_svdb, labels_svdb, rr_intervals_svdb = load_ecg_data(svdb_path, record_ids_svdb)
 
     # Obliczanie optymalnej długości segmentu na podstawie obu baz
-    optimal_segment_length = determine_optimal_segment_length(rr_intervals, rr_intervals_svdb)
+    optimal_segment_length = determine_optimal_segment_length([rr_intervals, rr_intervals_svdb])
 
     # Przetwarzanie sygnałów
     X, y = preprocess_signals(signals + signals_svdb, labels + labels_svdb, optimal_segment_length)
@@ -151,22 +148,8 @@ def main():
     # Reshape do CNN
     X_train, X_val, X_test = X_train[..., np.newaxis], X_val[..., np.newaxis], X_test[..., np.newaxis]
 
-    # Konwersja etykiet do one-hot encoding
+    # Konwersja etykiet do one-hot encoding z dodatkową klasą "Unknown"
     y_train, y_val, y_test = to_categorical(y_train, num_classes=num_classes), to_categorical(y_val, num_classes=num_classes), to_categorical(y_test, num_classes=num_classes)
-
-    # Sprawdzenie liczebności klas przed balansowaniem
-    print(f"Before balancing: {Counter(y_train.argmax(axis=1))}")
-
-    # Balansowanie klas za pomocą SMOTE (oversampling)
-    smote = SMOTE(sampling_strategy='auto', random_state=42)
-    X_train_2D = X_train.reshape(X_train.shape[0], -1)  # Przekształcenie do 2D dla SMOTE
-    X_train, y_train = smote.fit_resample(X_train_2D, y_train.argmax(axis=1))
-    y_train = to_categorical(y_train, num_classes=num_classes)
-    X_train = X_train.reshape(-1, optimal_segment_length, 1)  # Przywrócenie wymiarów CNN
-
-    # Sprawdzenie liczebności klas po balansowaniu
-    print(f"After balancing: {Counter(y_train.argmax(axis=1))}")
-
 
     # Definicja callbacków (Early Stopping + Reduce LR)
     early_stopping = tf.keras.callbacks.EarlyStopping(
@@ -185,26 +168,27 @@ def main():
     loss, accuracy = model.evaluate(X_test, y_test)
     print(f"Test accuracy: {accuracy:.4f}")
 
-
     # Zapis modelu
     model.save("ecg_classifier_mitbih_svdb.h5")
-
-
-
-
-
-
-
 
     # Oblicz macierz pomyłek
     y_pred = model.predict(X_test)
     y_pred_classes = np.argmax(y_pred, axis=1)
+    y_pred_max_confidence = np.max(y_pred, axis=1)
+
+    # 🔹 Jeśli pewność jest < 0.5, przypisz "Unknown" (czyli nową klasę `num_classes-1`)
+    y_pred_classes[y_pred_max_confidence < 0.5] = num_classes - 1
+
     y_true = np.argmax(y_test, axis=1)
 
-    cm = confusion_matrix(y_true, y_pred_classes)
+    # Aktualizacja macierzy pomyłek
+    cm = confusion_matrix(y_true, y_pred_classes, labels=np.arange(num_classes))
 
-    # 🔹 Zapis macierzy pomyłek do pliku CSV
-    df_cm = pd.DataFrame(cm, index=[i for i in range(num_classes)], columns=[i for i in range(num_classes)])
+    # 🔹 Dodaj nazwę dla nowej klasy "Unknown"
+    class_labels = list(label_map.keys()) + ["Unknown"]
+
+    # 🔹 Zaktualizuj macierz pomyłek w Pandas
+    df_cm = pd.DataFrame(cm, index=class_labels, columns=class_labels)
     df_cm.to_csv("confusion_matrix.csv", index=True)
     print("✅ Macierz pomyłek zapisana do 'confusion_matrix.csv'")
 
@@ -223,10 +207,5 @@ def main():
     plt.show()
 
 
-
-
-
-
 if __name__ == "__main__":
     main()
-
