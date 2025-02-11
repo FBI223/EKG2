@@ -1,6 +1,7 @@
 import os
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import tensorflow as tf
 import wfdb
@@ -11,6 +12,9 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras import layers, models
 from tensorflow.keras.utils import to_categorical
 from sklearn.utils.class_weight import compute_class_weight
+from imblearn.over_sampling import SMOTE
+from collections import Counter
+
 
 mitdb_path = "mitdb/"
 svdb_path = "svdb/"
@@ -20,16 +24,16 @@ label_map = {
     'N': 0,  # Normalny rytm
     'V': 1,  # Pobudzenie komorowe (PVC)
     'A': 2,  # Pobudzenie przedsionkowe (PAC) - MITDB
-    'S': 5,  # Pobudzenie nadkomorowe (SVPB) - SVDB
-    'L': 3,  # Blok lewej odnogi (LBBB)
-    'R': 4   # Blok prawej odnogi (RBBB)
+    'S': 3,  # Pobudzenie nadkomorowe (SVPB) - SVDB
+    'L': 4,  # Blok lewej odnogi (LBBB)
+    'R': 5   # Blok prawej odnogi (RBBB)
 }
 
 num_classes = len(label_map)  # Usunięto dodatkową klasę "Unknown"
 
 def get_class_weights(labels):
     class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-    return {i: class_weights[i] for i in range(len(class_weights))}
+    return {cls: weight for cls, weight in zip(np.unique(labels), class_weights)}
 
 def resample_ecg_signal(signal, annotation_samples, original_fs, target_fs):
     new_length = int(len(signal) * (target_fs / original_fs))
@@ -76,17 +80,36 @@ def preprocess_signals(signals, labels, optimal_segment_length):
 
 def build_cnn(input_shape, number_of_classes):
     model = models.Sequential([
-        layers.Conv1D(32, kernel_size=5, activation='relu', input_shape=input_shape),
+        layers.Conv1D(64, kernel_size=7, strides=1, padding='same', input_shape=input_shape),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(negative_slope=0.1),
         layers.MaxPooling1D(pool_size=2),
-        layers.Conv1D(64, kernel_size=3, activation='relu'),
+
+        layers.Conv1D(128, kernel_size=5, strides=1, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(negative_slope=0.1),
         layers.MaxPooling1D(pool_size=2),
-        layers.Conv1D(128, kernel_size=3, activation='relu'),
+
+        layers.Conv1D(256, kernel_size=3, strides=1, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(negative_slope=0.1),
+        layers.MaxPooling1D(pool_size=2),
+
+        layers.Conv1D(512, kernel_size=3, strides=1, padding='same'),
+        layers.BatchNormalization(),
+        layers.LeakyReLU(negative_slope=0.1),
         layers.GlobalAveragePooling1D(),
-        layers.Dense(64, activation='relu'),
+
+        layers.Dense(128, activation='relu'),
+        layers.Dropout(0.5),  # Mocniejszy dropout
         layers.Dense(number_of_classes, activation='softmax')
     ])
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                  loss='categorical_crossentropy', metrics=['accuracy'])
+
     return model
+
 
 
 def balance_dataset(X, y):
@@ -96,10 +119,14 @@ def balance_dataset(X, y):
 
 
 
-from imblearn.over_sampling import SMOTE
-from collections import Counter
+
+
 
 def main():
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    TF_CPP_MIN_LOG_LEVEL = '2'
+
+
     # Wczytanie rekordów MITDB
     record_ids = get_record_ids(mitdb_path)
     signals, labels, rr_intervals = load_ecg_data(mitdb_path, record_ids)
@@ -132,38 +159,74 @@ def main():
 
     # Balansowanie klas za pomocą SMOTE (oversampling)
     smote = SMOTE(sampling_strategy='auto', random_state=42)
-    X_train, y_train = smote.fit_resample(X_train.reshape(X_train.shape[0], -1), y_train.argmax(axis=1))
+    X_train_2D = X_train.reshape(X_train.shape[0], -1)  # Przekształcenie do 2D dla SMOTE
+    X_train, y_train = smote.fit_resample(X_train_2D, y_train.argmax(axis=1))
     y_train = to_categorical(y_train, num_classes=num_classes)
     X_train = X_train.reshape(-1, optimal_segment_length, 1)  # Przywrócenie wymiarów CNN
 
     # Sprawdzenie liczebności klas po balansowaniu
     print(f"After balancing: {Counter(y_train.argmax(axis=1))}")
 
-    # Obliczenie wag klas (dla modelu)
-    class_weights = get_class_weights(y_train.argmax(axis=1))
+
+    # Definicja callbacków (Early Stopping + Reduce LR)
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        patience=5, restore_best_weights=True, monitor='val_loss', min_delta=0.001
+    )
+
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss', factor=0.3, patience=2, verbose=1, min_lr=1e-5
+    )
 
     # Budowa i trening modelu
     model = build_cnn((optimal_segment_length, 1), num_classes)
-    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=20, batch_size=64,
-              class_weight=class_weights, callbacks=[tf.keras.callbacks.EarlyStopping(patience=4, restore_best_weights=True)])
+    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=20, batch_size=32, callbacks=[early_stopping, reduce_lr])
 
     # Ocena modelu na zbiorze testowym
     loss, accuracy = model.evaluate(X_test, y_test)
     print(f"Test accuracy: {accuracy:.4f}")
 
-    # Macierz pomyłek
+
+    # Zapis modelu
+    model.save("ecg_classifier_mitbih_svdb.h5")
+
+
+
+
+
+
+
+
+    # Oblicz macierz pomyłek
     y_pred = model.predict(X_test)
     y_pred_classes = np.argmax(y_pred, axis=1)
     y_true = np.argmax(y_test, axis=1)
 
     cm = confusion_matrix(y_true, y_pred_classes)
+
+    # 🔹 Zapis macierzy pomyłek do pliku CSV
+    df_cm = pd.DataFrame(cm, index=[i for i in range(num_classes)], columns=[i for i in range(num_classes)])
+    df_cm.to_csv("confusion_matrix.csv", index=True)
+    print("✅ Macierz pomyłek zapisana do 'confusion_matrix.csv'")
+
+    # 🔹 Wizualizacja i zapis jako obraz
+    plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
     plt.xlabel("Predykcja")
     plt.ylabel("Prawdziwa klasa")
+    plt.title("Macierz Pomyłek")
+
+    # Zapis jako plik PNG
+    plt.savefig("confusion_matrix.png")
+    print("✅ Macierz pomyłek zapisana do 'confusion_matrix.png'")
+
+    # Pokazanie wykresu w notebooku (opcjonalne)
     plt.show()
 
-    # Zapis modelu
-    model.save("ecg_classifier_mitbih_svdb.h5")
+
+
+
+
 
 if __name__ == "__main__":
     main()
+
