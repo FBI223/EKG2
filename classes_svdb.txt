@@ -1,4 +1,5 @@
 Liczba wystąpień każdej klasy w svdb:
+
 N: 162339
 S: 12188
 V: 9943
