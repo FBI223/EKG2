@@ -125,11 +125,7 @@ def visualize_qrs_peak(signal):
 
 
 
-def balance_classes_oversampling(X, y):
-    """🔄 Oversampling klas mniejszościowych do liczby próbek klasy dominującej."""
-    ros = RandomOverSampler(sampling_strategy='auto', random_state=42)
-    X_resampled, y_resampled = ros.fit_resample(X.reshape(len(X), -1), y)
-    return X_resampled.reshape(len(X_resampled), SEGMENT_LENGTH), y_resampled
+
 
 def balance_classes(X, y, class_to_reduce=0, reduction_factor=0.5):
     """🔄 Redukcja liczby segmentów klasy `class_to_reduce`."""
@@ -192,45 +188,37 @@ def load_ecg_data(db_path, record_ids):
     return np.array(signals), np.array(labels)
 
 
-### 🔥 **4. Tworzenie modelu CNN+LSTM**
+def balance_classes_oversampling(X, y):
+    """🔄 Oversampling klas mniejszościowych do liczby próbek klasy dominującej."""
+    ros = RandomOverSampler(sampling_strategy='auto', random_state=42)
+    X_resampled, y_resampled = ros.fit_resample(X.reshape(len(X), -1), y)
+    return X_resampled.reshape(len(X_resampled), SEGMENT_LENGTH), y_resampled
+
+
 def build_cnn_lstm(input_shape, num_classes):
     model = models.Sequential([
-
         layers.Masking(mask_value=0, input_shape=(SEGMENT_LENGTH, 1)),
-
-        layers.Conv1D(64, kernel_size=11, padding='same', input_shape=input_shape),
+        layers.Conv1D(128, kernel_size=15, padding='same', activation='relu'),
         layers.BatchNormalization(),
-        layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
-
-        layers.Conv1D(128, kernel_size=7, padding='same'),
+        layers.Conv1D(256, kernel_size=9, padding='same', activation='relu'),
         layers.BatchNormalization(),
-        layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
-
-        layers.Conv1D(256, kernel_size=5, padding='same'),
+        layers.Conv1D(512, kernel_size=5, padding='same', activation='relu'),
         layers.BatchNormalization(),
-        layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
-
-        layers.LSTM(64, return_sequences=False),
-        layers.Dense(128, activation='relu'),
+        layers.LSTM(128, return_sequences=False),
+        layers.Dense(256, activation='relu'),
         layers.Dropout(0.5),
         layers.Dense(num_classes, activation='softmax')
     ])
-
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
                   loss='categorical_crossentropy',
                   metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()])
-
     return model
 
-
-### 🔥 **5. Trening modelu i generowanie statystyk**
 def train_model():
-
     print("Czy TensorFlow widzi GPU?", tf.config.list_physical_devices('GPU'))
-
 
     # Wczytanie rekordów MITDB i SVDB
     record_ids = sorted([f.split('.')[0] for f in os.listdir(MITDB_PATH) if f.endswith('.hea')])
@@ -240,16 +228,10 @@ def train_model():
     signals_svdb, labels_svdb = load_ecg_data(SVDB_PATH, record_ids_svdb)
 
     # Połączenie zbiorów
-    #X, y =  signals_mitdb, labels_mitdb
-
-    # Połączenie zbiorów
-    #X, y =  signals_svdb, labels_svdb
-
-
-    # Połączenie zbiorów
     X, y = np.concatenate((signals_mitdb, signals_svdb)), np.concatenate((labels_mitdb, labels_svdb))
 
-    X, y = balance_classes(X, y, class_to_reduce=0, reduction_factor=0.8)  # Zostaw tylko 30% normalnych
+
+    X, y = balance_classes(X,y,0,0.7)
 
     # Oversampling zamiast redukcji klasy dominującej
     X, y = balance_classes_oversampling(X, y)
@@ -271,7 +253,7 @@ def train_model():
 
     # Budowa i trening modelu
     model = build_cnn_lstm((SEGMENT_LENGTH, 1), NUM_CLASSES)
-    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=32, callbacks=[early_stopping, reduce_lr])
+    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=20, batch_size=16 , callbacks=[early_stopping, reduce_lr])
 
     # Ewaluacja modelu
     y_pred = model.predict(X_test)
@@ -290,3 +272,4 @@ def train_model():
 
 if __name__ == "__main__":
     train_model()
+
