@@ -1,248 +1,275 @@
 import os
-from collections import Counter
-
-import matplotlib.pyplot as plt
+import wfdb
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import matplotlib.pyplot as plt
 import tensorflow as tf
-import wfdb
-from scipy.signal import resample
-from sklearn.metrics import confusion_matrix
-from sklearn.model_selection import train_test_split
+from scipy.signal import butter, filtfilt, resample
+from biosppy.signals import ecg
 from tensorflow.keras import layers, models
 from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, precision_score, recall_score, f1_score
+from scipy.signal import butter, filtfilt
+from scipy.signal import iirnotch
+import pywt
 
-ICENTIA11K_PATH = "D:/EKG/BAZA/icentia11k-single-lead-continuous-raw-electrocardiogram-dataset-1.0"
+
+
+# 📂 Foldery z danymi MITDB i SVDB
 MITDB_PATH = "mitdb/"
 SVDB_PATH = "svdb/"
 
-# Optimal segment length: 270
+# 🔹 Docelowa częstotliwość próbkowania
+TARGET_FS = 360
+SEGMENT_LENGTH = 200  # Długość segmentu w próbkach (QRS w środku)
 
-LABEL_MAP = {
-    'N': 0,  # Normalny rytm
-    'V': 1,  # Pobudzenie komorowe (PVC)
-    'A': 2,  # Pobudzenie przedsionkowe (PAC) - MITDB
-    'S': 3,  # Pobudzenie nadkomorowe (SVPB) - SVDB
-    'L': 4,  # Blok lewej odnogi (LBBB)
-    'R': 5   # Blok prawej odnogi (RBBB)
-}
-
+# 🔹 Mapowanie etykiet
+LABEL_MAP_ORIGINAL = {'N': 0, 'V': 1, 'A': 2, 'S': 3, 'L': 4, 'R': 5}
+LABEL_MAP = {'N': 0, 'V': 1, 'S': 2}
+LABEL_MAP_MITDB = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
+LABEL_NAMES = list(LABEL_MAP.keys())  # Kolejność klas
 NUM_CLASSES = len(LABEL_MAP)
 
 
 
-def resample_ecg_signal(signal, annotation_samples, original_fs, target_fs):
+
+import numpy as np
+import pywt
+from scipy.signal import butter, filtfilt, sosfilt, iirnotch
+
+def bandpass_filter(signal, fs, lowcut=0.5, highcut=50, order=4):
+    """📌 Filtr pasmowo-przepustowy (0.5–50 Hz) do usunięcia zakłóceń mięśniowych i drgań."""
+    nyq = 0.5 * fs
+    if lowcut >= highcut or highcut >= nyq:
+        raise ValueError("Niepoprawne wartości filtracji pasmowo-przepustowej: lowcut < highcut < Nyquist")
+
+    low = lowcut / nyq
+    high = highcut / nyq
+    sos = butter(order, [low, high], btype='bandpass', output='sos')
+    return sosfilt(sos, signal)
+
+def notch_filter(signal, fs, freq=50, quality_factor=30):
+    """📌 Filtr Notch do usunięcia zakłóceń sieciowych (np. 50 Hz lub 60 Hz)."""
+    nyq = 0.5 * fs
+    if freq >= nyq:
+        raise ValueError("Częstotliwość Notch musi być mniejsza niż Nyquist")
+
+    w0 = freq / nyq
+    b, a = iirnotch(w0, quality_factor)
+    return filtfilt(b, a, signal)
+
+def highpass_filter(signal, fs, lowcut=0.5, order=4):
+    """📌 Filtr górnoprzepustowy (usuwa drift bazowy poniżej 0.5 Hz)."""
+    nyq = 0.5 * fs
+    if lowcut >= nyq:
+        raise ValueError("Częstotliwość odcięcia highpass musi być mniejsza niż Nyquist")
+
+    low = lowcut / nyq
+    sos = butter(order, low, btype='highpass', output='sos')
+    return sosfilt(sos, signal)
+
+def wavelet_denoising(signal, wavelet='db6', level=5):
+    """📌 Usuwa szum mięśniowy za pomocą DWT (Dekompozycja falkowa)."""
+    coeffs = pywt.wavedec(signal, wavelet, level=level)
+    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+    threshold = sigma * np.sqrt(2 * np.log(len(signal)))
+    coeffs_thresh = [pywt.threshold(c, threshold, mode='soft') for c in coeffs]
+    return pywt.waverec(coeffs_thresh, wavelet)
+
+def filter_ecg_2(signal, fs):
+    """📌 Kompleksowa filtracja sygnału EKG:
+        - Pasmo 0.5–50 Hz
+        - Usunięcie 50 Hz (lub 60 Hz)
+        - Eliminacja driftu bazowego
+        - Usunięcie szumu mięśniowego falkami
+    """
+    signal = bandpass_filter(signal, fs)
+    signal = notch_filter(signal, fs)
+    signal = highpass_filter(signal, fs)
+    signal = wavelet_denoising(signal)
+    return signal
+
+
+
+
+
+
+### 🔥 **1. Filtracja sygnału (redukcja szumów)**
+def filter_ecg(signal, fs=TARGET_FS):
+    """📌 Filtracja pasmowo-przepustowa 0.5–50 Hz, usunięcie zakłóceń mięśniowych"""
+    nyq = 0.5 * fs
+    low = 0.5 / nyq
+    high = 50 / nyq
+    b, a = butter(4, [low, high], btype='bandpass')
+    return filtfilt(b, a, signal)
+
+
+
+
+def visualize_qrs_peak(signal):
+    """
+    Rysuje i zapisuje interpolowany segment EKG z naniesionymi adnotacjami.
+
+    :param signal: Interpolowany sygnał EKG (1D numpy array).
+    :param annotations: Lista indeksów adnotacji po interpolacji.
+    :param segment_id: Numer segmentu, do nazwy pliku.
+    :param patient_name: Nazwa pacjenta do personalizacji plików.
+    """
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(signal, color="b", linewidth=1, label="fragment sygnału")
+
+    plt.xlabel("Próbki")
+    plt.ylabel("Znormalizowana wartość")
+    plt.title(f"Interpolowany segment EKG")
+    plt.legend()
+
+    # ✅ Wyświetlenie wykresu na ekranie
+    plt.show()
+
+
+
+
+
+### 🔥 **2. Resampling sygnału**
+def resample_ecg_signal(signal, annotation_samples, original_fs, target_fs=TARGET_FS):
+    """🔄 Resampling sygnału do docelowej częstotliwości"""
     new_length = int(len(signal) * (target_fs / original_fs))
     resampled_signal = resample(signal, new_length)
     scale_factor = target_fs / original_fs
     resampled_annotations = np.round(np.array(annotation_samples) * scale_factor).astype(int)
     return resampled_signal, resampled_annotations
 
-def get_record_ids(db_path):
-    return sorted(list(set(f.split('.')[0] for f in os.listdir(db_path) if f.endswith('.hea'))))
 
-def load_ecg_data(db_path, record_ids, target_fs=360):
-    signals, labels, rr_intervals = [], [], []
+### 🔥 **3. Wczytywanie i przetwarzanie danych**
+def load_ecg_data(db_path, record_ids):
+    signals, labels = [], []
+
     for record_id in record_ids:
         record = wfdb.rdrecord(f'{db_path}/{record_id}')
         annotation = wfdb.rdann(f'{db_path}/{record_id}', 'atr')
-        signal = record.p_signal[:, 0]
-        original_fs = record.fs
-        if original_fs != target_fs:
-            signal, annotation.sample = resample_ecg_signal(signal, annotation.sample, original_fs, target_fs)
-        rr_intervals.extend(np.diff(annotation.sample))
-        for i, r in enumerate(annotation.sample[:-1]):
-            next_r = annotation.sample[i + 1]
-            segment = signal[r:next_r]
+        signal = record.p_signal[:, 0]  # Pobranie 1. odprowadzenia
+        original_fs = record.fs  # Oryginalna częstotliwość próbkowania
+
+        # 🔹 Resampling do TARGET_FS
+        if original_fs != TARGET_FS:
+            signal, annotation.sample = resample_ecg_signal(signal, annotation.sample, original_fs, TARGET_FS)
+
+        # 🔹 Filtracja sygnału
+        signal = filter_ecg(signal, TARGET_FS)
+
+        # 🔹 Segmentacja QRS w środku
+        for i, r in enumerate(annotation.sample):
             if annotation.symbol[i] in LABEL_MAP:
+                start = max(0, r - SEGMENT_LENGTH // 2)
+                end = min(len(signal), r + SEGMENT_LENGTH // 2)
+
+                segment = signal[start:end]
+
+                if  len(segment) != SEGMENT_LENGTH and len(segment) / SEGMENT_LENGTH > 0.75:
+                    segment = np.pad(segment, (0, SEGMENT_LENGTH - len(segment)), mode='edge')
+                    visualize_qrs_peak(segment)
+                elif len(segment) < SEGMENT_LENGTH:
+                    continue
+
+
                 signals.append(segment)
                 labels.append(LABEL_MAP[annotation.symbol[i]])
-    return signals, labels, rr_intervals
 
-def determine_optimal_segment_length(all_intervals):
-    combined_rr_intervals = np.concatenate(all_intervals)
-    return int(np.median(combined_rr_intervals))
+    return np.array(signals), np.array(labels)
 
-def preprocess_signals(signals, labels, optimal_segment_length):
-    filtered_signals, filtered_labels = [], []
 
-    for i in range(len(labels)):
-        segment = signals[i]
-
-        # 🔹 Jeśli klasa to 'S', używamy większego okna czasowego
-        if labels[i] == 3:  # Klasa S (SVPB)
-            target_length = optimal_segment_length * 2  # Dłuższe okno dla S
-        else:
-            target_length = optimal_segment_length
-
-        # Przycinanie lub padding do odpowiedniego rozmiaru
-        if len(segment) >= target_length:
-            segment = segment[:target_length]
-        else:
-            segment = np.pad(segment, (0, target_length - len(segment)), mode='constant')
-
-        # Resampling do jednolitego rozmiaru
-        segment = resample(segment, optimal_segment_length)
-
-        filtered_signals.append(segment)
-        filtered_labels.append(labels[i])
-
-    return np.array(filtered_signals), np.array(filtered_labels)
-
-def build_cnn(input_shape, number_of_classes):
+### 🔥 **4. Tworzenie modelu CNN+LSTM**
+def build_cnn_lstm(input_shape, num_classes):
     model = models.Sequential([
-        layers.Conv1D(64, kernel_size=11, strides=1, padding='same', input_shape=input_shape),
+
+        layers.Masking(mask_value=0, input_shape=(SEGMENT_LENGTH, 1)),
+
+        layers.Conv1D(64, kernel_size=11, padding='same', input_shape=input_shape),
         layers.BatchNormalization(),
-        layers.LeakyReLU(alpha=0.1),
+        layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
 
-        layers.Conv1D(128, kernel_size=7, strides=1, padding='same'),
+        layers.Conv1D(128, kernel_size=7, padding='same'),
         layers.BatchNormalization(),
-        layers.LeakyReLU(alpha=0.1),
+        layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
 
-        layers.Conv1D(256, kernel_size=5, strides=1, padding='same'),
+        layers.Conv1D(256, kernel_size=5, padding='same'),
         layers.BatchNormalization(),
-        layers.LeakyReLU(alpha=0.1),
+        layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
 
-        layers.Conv1D(256, kernel_size=3, strides=1, padding='same'),
-        layers.BatchNormalization(),
-        layers.LeakyReLU(alpha=0.1),
-
-        layers.LSTM(64, return_sequences=False),  # Dodanie warstwy LSTM
+        layers.LSTM(64, return_sequences=False),
         layers.Dense(128, activation='relu'),
         layers.Dropout(0.5),
-        layers.Dense(number_of_classes, activation='softmax')
+        layers.Dense(num_classes, activation='softmax')
     ])
 
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                  loss='categorical_crossentropy', metrics=['accuracy'])
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()])
 
     return model
 
 
-def count_annotations(db_path):
-    """Zlicza liczbę wystąpień każdej etykiety w zbiorze danych"""
-    label_counts = Counter()
+### 🔥 **5. Trening modelu i generowanie statystyk**
+def train_model():
+    # Wczytanie rekordów MITDB i SVDB
+    #record_ids = sorted([f.split('.')[0] for f in os.listdir(MITDB_PATH) if f.endswith('.hea')])
+    #signals_mitdb, labels_mitdb = load_ecg_data(MITDB_PATH, record_ids)
 
-    record_ids = get_record_ids(db_path)
+    record_ids_svdb = sorted([f.split('.')[0] for f in os.listdir(SVDB_PATH) if f.endswith('.hea')])
+    signals_svdb, labels_svdb = load_ecg_data(SVDB_PATH, record_ids_svdb)
 
-    for record_id in record_ids:
-        annotation_file = os.path.join(db_path, record_id)
-        try:
-            annotation = wfdb.rdann(annotation_file, 'atr')  # Wczytanie adnotacji
-            label_counts.update(annotation.symbol)  # Zliczanie etykiet
-        except Exception as e:
-            print(f"❌ Błąd podczas przetwarzania {record_id}: {e}")
-
-    return label_counts
+    # Połączenie zbiorów
+    #X, y =  signals_mitdb, labels_mitdb
 
 
-def main():
-    # 🔹 Ustawienia TensorFlow dla optymalnej pracy na GPU
-    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+    # Połączenie zbiorów
+    X, y =  signals_svdb, labels_svdb
 
-    '''
-    label_counts = count_annotations(ICENTIA11K_PATH)
-    print("📊 Liczność każdej etykiety w zbiorze Icentia11k:")
-    for label, count in label_counts.most_common():
-        print(f"{label}: {count}")
-    '''
 
-    # Wczytanie rekordów MITDB
-    record_ids = get_record_ids(MITDB_PATH)
-    signals, labels, rr_intervals = load_ecg_data(MITDB_PATH, record_ids)
+    # Połączenie zbiorów
+    #X, y = np.concatenate((signals_mitdb, signals_svdb)), np.concatenate((labels_mitdb, labels_svdb))
 
-    # Wczytanie rekordów SVDB
-    record_ids_svdb = get_record_ids(SVDB_PATH)
-    signals_svdb, labels_svdb, rr_intervals_svdb = load_ecg_data(SVDB_PATH, record_ids_svdb)
-
-    # Obliczanie optymalnej długości segmentu na podstawie obu baz
-    optimal_segment_length = determine_optimal_segment_length([rr_intervals, rr_intervals_svdb])
-    print('Optimal segment length:', optimal_segment_length)
-
-    # Przetwarzanie sygnałów
-    X, y = preprocess_signals(signals + signals_svdb, labels + labels_svdb, optimal_segment_length)
-
-    # Normalizacja danych (globalna)
+    # Normalizacja
     X = (X - np.mean(X)) / np.std(X)
 
-    # Podział na zestawy treningowe, walidacyjne i testowe
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, random_state=42, stratify=y_train)
+    # Podział na zbiory treningowe i testowe
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, stratify=y_train, random_state=42)
 
-    # Reshape do CNN
+    # Reshape dla CNN
     X_train, X_val, X_test = X_train[..., np.newaxis], X_val[..., np.newaxis], X_test[..., np.newaxis]
+    y_train, y_val, y_test = to_categorical(y_train, NUM_CLASSES), to_categorical(y_val, NUM_CLASSES), to_categorical(y_test, NUM_CLASSES)
 
-    # Konwersja etykiet do one-hot encoding z dodatkową klasą "Unknown"
-    y_train, y_val, y_test = to_categorical(y_train, num_classes=NUM_CLASSES), to_categorical(y_val, num_classes=NUM_CLASSES), to_categorical(y_test, num_classes=NUM_CLASSES)
-
-    # Definicja callbacków (Early Stopping + Reduce LR)
-    early_stopping = tf.keras.callbacks.EarlyStopping(
-        patience=5, restore_best_weights=True, monitor='val_loss', min_delta=0.001
-    )
-
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.3, patience=2, verbose=1, min_lr=1e-5
-    )
+    # 📌 CALLBACKS
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=3, min_lr=1e-5)
 
     # Budowa i trening modelu
-    model = build_cnn((optimal_segment_length, 1), NUM_CLASSES)
-    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=32, callbacks=[early_stopping, reduce_lr])
+    model = build_cnn_lstm((SEGMENT_LENGTH, 1), NUM_CLASSES)
+    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=3, batch_size=32, callbacks=[early_stopping, reduce_lr])
 
-    # Ocena modelu na zbiorze testowym
-    loss, accuracy = model.evaluate(X_test, y_test)
-    print(f"Test accuracy: {accuracy:.4f}")
-
-    # Zapis modelu
-    model.save("ecg_classifier_mitbih_svdb.h5")
-
-    # 🔹 Predykcja modelu na zbiorze testowym
+    # Ewaluacja modelu
     y_pred = model.predict(X_test)
-    y_pred_max_confidence = np.max(y_pred, axis=1)  # Maksymalne prawdopodobieństwo
-    y_pred_classes = np.argmax(y_pred, axis=1)  # Klasa o najwyższym prawdopodobieństwie
-
-    # Prawdziwe klasy
+    y_pred_classes = np.argmax(y_pred, axis=1)
     y_true = np.argmax(y_test, axis=1)
 
-    # Aktualizacja macierzy pomyłek
-    cm = confusion_matrix(y_true, y_pred_classes, labels=np.arange(NUM_CLASSES))
+    # 🔹 Statystyki
+    report = classification_report(y_true, y_pred_classes, target_names=LABEL_NAMES)
+    print("\n📊 Statystyki modelu:\n", report)
 
-    # 🔹 Dodaj nazwę dla nowej klasy "Unknown"
-    class_labels = list(LABEL_MAP.keys())
+    # 🔹 Macierz pomyłek
+    cm = confusion_matrix(y_true, y_pred_classes)
+    print("🔹 Specyficzność (TNR):", cm.diagonal() / cm.sum(axis=1))
 
-    # 🔹 Zaktualizuj macierz pomyłek w Pandas
-    df_cm = pd.DataFrame(cm, index=class_labels, columns=class_labels)
-    df_cm.to_csv("confusion_matrix.csv", index=True)
-    print("✅ Macierz pomyłek zapisana do 'confusion_matrix.csv'")
-
-    # 🔹 Wizualizacja i zapis jako obraz
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-    plt.xlabel("Predykcja")
-    plt.ylabel("Prawdziwa klasa")
-    plt.title("Macierz Pomyłek")
-
-    # Zapis jako plik PNG
-    plt.savefig("confusion_matrix.png")
-    print("✅ Macierz pomyłek zapisana do 'confusion_matrix.png'")
-
-    # Pokazanie wykresu w notebooku (opcjonalne)
-    plt.show()
-
-    # 🔹 Dodatkowa analiza – histogram pewności predykcji
-    plt.figure(figsize=(8, 4))
-    plt.hist(y_pred_max_confidence, bins=20, edgecolor='black')
-    plt.xlabel("Maksymalne prawdopodobieństwo predykcji")
-    plt.ylabel("Liczba próbek")
-    plt.title("Histogram pewności predykcji")
-    plt.savefig("confidence_histogram.png")
-    print("✅ Histogram pewności zapisany do 'confidence_histogram.png'")
-    plt.show()
+    # Zapis modelu
+    model.save("ecg_classifier.h5")
 
 
 if __name__ == "__main__":
-    main()
+    train_model()
