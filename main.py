@@ -1,20 +1,17 @@
 import os
 import wfdb
-import numpy as np
-import pandas as pd
-import seaborn as sns
 import matplotlib.pyplot as plt
 import tensorflow as tf
-from scipy.signal import butter, filtfilt, resample
-from biosppy.signals import ecg
+from imblearn.over_sampling import RandomOverSampler
+from scipy.signal import resample
 from tensorflow.keras import layers, models
 from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, precision_score, recall_score, f1_score
-from scipy.signal import butter, filtfilt
-from scipy.signal import iirnotch
+from sklearn.metrics import confusion_matrix, classification_report
+import numpy as np
 import pywt
-
+from scipy.signal import butter, filtfilt, sosfilt, iirnotch
+import seaborn as sns
 
 
 # 📂 Foldery z danymi MITDB i SVDB
@@ -26,8 +23,8 @@ TARGET_FS = 360
 SEGMENT_LENGTH = 200  # Długość segmentu w próbkach (QRS w środku)
 
 # 🔹 Mapowanie etykiet
-LABEL_MAP_ORIGINAL = {'N': 0, 'V': 1, 'A': 2, 'S': 3, 'L': 4, 'R': 5}
-LABEL_MAP = {'N': 0, 'V': 1, 'S': 2}
+LABEL_MAP = {'N': 0, 'V': 1, 'A': 2, 'S': 3, 'L': 4, 'R': 5}
+LABEL_MAP_SVDB = {'N': 0, 'V': 1, 'S': 2}
 LABEL_MAP_MITDB = {'N': 0, 'V': 1, 'A': 2, 'L': 3, 'R': 4}
 LABEL_NAMES = list(LABEL_MAP.keys())  # Kolejność klas
 NUM_CLASSES = len(LABEL_MAP)
@@ -35,9 +32,6 @@ NUM_CLASSES = len(LABEL_MAP)
 
 
 
-import numpy as np
-import pywt
-from scipy.signal import butter, filtfilt, sosfilt, iirnotch
 
 def bandpass_filter(signal, fs, lowcut=0.5, highcut=50, order=4):
     """📌 Filtr pasmowo-przepustowy (0.5–50 Hz) do usunięcia zakłóceń mięśniowych i drgań."""
@@ -78,7 +72,7 @@ def wavelet_denoising(signal, wavelet='db6', level=5):
     coeffs_thresh = [pywt.threshold(c, threshold, mode='soft') for c in coeffs]
     return pywt.waverec(coeffs_thresh, wavelet)
 
-def filter_ecg_2(signal, fs):
+def filter_ecg(signal, fs):
     """📌 Kompleksowa filtracja sygnału EKG:
         - Pasmo 0.5–50 Hz
         - Usunięcie 50 Hz (lub 60 Hz)
@@ -93,17 +87,17 @@ def filter_ecg_2(signal, fs):
 
 
 
+def plot_confusion_matrix(y_true, y_pred, labels):
+    """ Rysuje macierz błędów """
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Confusion Matrix")
+    plt.show()
 
 
-
-### 🔥 **1. Filtracja sygnału (redukcja szumów)**
-def filter_ecg(signal, fs=TARGET_FS):
-    """📌 Filtracja pasmowo-przepustowa 0.5–50 Hz, usunięcie zakłóceń mięśniowych"""
-    nyq = 0.5 * fs
-    low = 0.5 / nyq
-    high = 50 / nyq
-    b, a = butter(4, [low, high], btype='bandpass')
-    return filtfilt(b, a, signal)
 
 
 
@@ -129,6 +123,23 @@ def visualize_qrs_peak(signal):
     # ✅ Wyświetlenie wykresu na ekranie
     plt.show()
 
+
+
+def balance_classes_oversampling(X, y):
+    """🔄 Oversampling klas mniejszościowych do liczby próbek klasy dominującej."""
+    ros = RandomOverSampler(sampling_strategy='auto', random_state=42)
+    X_resampled, y_resampled = ros.fit_resample(X.reshape(len(X), -1), y)
+    return X_resampled.reshape(len(X_resampled), SEGMENT_LENGTH), y_resampled
+
+def balance_classes(X, y, class_to_reduce=0, reduction_factor=0.5):
+    """🔄 Redukcja liczby segmentów klasy `class_to_reduce`."""
+    idx_class = np.where(y == class_to_reduce)[0]  # Znajdź indeksy klasy "N"
+    num_to_remove = int(len(idx_class) * reduction_factor)  # Określ liczbę do usunięcia
+
+    idx_remove = np.random.choice(idx_class, num_to_remove, replace=False)  # Wylosuj do usunięcia
+    idx_keep = np.setdiff1d(np.arange(len(y)), idx_remove)  # Indeksy, które zostawiamy
+
+    return X[idx_keep], y[idx_keep]
 
 
 
@@ -167,16 +178,16 @@ def load_ecg_data(db_path, record_ids):
                 end = min(len(signal), r + SEGMENT_LENGTH // 2)
 
                 segment = signal[start:end]
+                segment_len = len(segment)
 
-                if  len(segment) != SEGMENT_LENGTH and len(segment) / SEGMENT_LENGTH > 0.75:
-                    segment = np.pad(segment, (0, SEGMENT_LENGTH - len(segment)), mode='edge')
-                    visualize_qrs_peak(segment)
-                elif len(segment) < SEGMENT_LENGTH:
-                    continue
+                if segment_len < SEGMENT_LENGTH:
+                    pad_left = (SEGMENT_LENGTH - segment_len) // 2
+                    pad_right = SEGMENT_LENGTH - segment_len - pad_left
+                    segment = np.pad(segment, (pad_left, pad_right), mode='edge')
 
-
-                signals.append(segment)
-                labels.append(LABEL_MAP[annotation.symbol[i]])
+                if len(segment) == SEGMENT_LENGTH:
+                    signals.append(segment)
+                    labels.append(LABEL_MAP[annotation.symbol[i]])
 
     return np.array(signals), np.array(labels)
 
@@ -217,9 +228,13 @@ def build_cnn_lstm(input_shape, num_classes):
 
 ### 🔥 **5. Trening modelu i generowanie statystyk**
 def train_model():
+
+    print("Czy TensorFlow widzi GPU?", tf.config.list_physical_devices('GPU'))
+
+
     # Wczytanie rekordów MITDB i SVDB
-    #record_ids = sorted([f.split('.')[0] for f in os.listdir(MITDB_PATH) if f.endswith('.hea')])
-    #signals_mitdb, labels_mitdb = load_ecg_data(MITDB_PATH, record_ids)
+    record_ids = sorted([f.split('.')[0] for f in os.listdir(MITDB_PATH) if f.endswith('.hea')])
+    signals_mitdb, labels_mitdb = load_ecg_data(MITDB_PATH, record_ids)
 
     record_ids_svdb = sorted([f.split('.')[0] for f in os.listdir(SVDB_PATH) if f.endswith('.hea')])
     signals_svdb, labels_svdb = load_ecg_data(SVDB_PATH, record_ids_svdb)
@@ -227,18 +242,22 @@ def train_model():
     # Połączenie zbiorów
     #X, y =  signals_mitdb, labels_mitdb
 
+    # Połączenie zbiorów
+    #X, y =  signals_svdb, labels_svdb
+
 
     # Połączenie zbiorów
-    X, y =  signals_svdb, labels_svdb
+    X, y = np.concatenate((signals_mitdb, signals_svdb)), np.concatenate((labels_mitdb, labels_svdb))
 
+    X, y = balance_classes(X, y, class_to_reduce=0, reduction_factor=0.8)  # Zostaw tylko 30% normalnych
 
-    # Połączenie zbiorów
-    #X, y = np.concatenate((signals_mitdb, signals_svdb)), np.concatenate((labels_mitdb, labels_svdb))
+    # Oversampling zamiast redukcji klasy dominującej
+    X, y = balance_classes_oversampling(X, y)
 
     # Normalizacja
     X = (X - np.mean(X)) / np.std(X)
 
-    # Podział na zbiory treningowe i testowe
+    # Podział na zbiory treningowe, walidacyjne i testowe
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
     X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, stratify=y_train, random_state=42)
 
@@ -252,7 +271,7 @@ def train_model():
 
     # Budowa i trening modelu
     model = build_cnn_lstm((SEGMENT_LENGTH, 1), NUM_CLASSES)
-    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=3, batch_size=32, callbacks=[early_stopping, reduce_lr])
+    model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=32, callbacks=[early_stopping, reduce_lr])
 
     # Ewaluacja modelu
     y_pred = model.predict(X_test)
@@ -264,12 +283,10 @@ def train_model():
     print("\n📊 Statystyki modelu:\n", report)
 
     # 🔹 Macierz pomyłek
-    cm = confusion_matrix(y_true, y_pred_classes)
-    print("🔹 Specyficzność (TNR):", cm.diagonal() / cm.sum(axis=1))
+    plot_confusion_matrix(y_true, y_pred_classes, LABEL_NAMES)
 
     # Zapis modelu
     model.save("ecg_classifier.h5")
-
 
 if __name__ == "__main__":
     train_model()
