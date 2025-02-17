@@ -1,0 +1,13 @@
+Statystyki modelu:
+               precision    recall  f1-score   support
+
+           N       0.96      0.93      0.94      9495
+           V       0.98      0.97      0.98      9496
+           A       0.99      1.00      1.00      9496
+           S       0.93      0.95      0.94      9496
+           L       1.00      1.00      1.00      9496
+           R       1.00      1.00      1.00      9496
+
+    accuracy                           0.98     56975
+   macro avg       0.98      0.98      0.98     56975
+weighted avg       0.98      0.98      0.98     56975
